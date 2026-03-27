@@ -1,114 +1,87 @@
-from datasets import load_dataset
-import pandas as pd
+import os
+import time
 import random
+import pandas as pd
+import google.generativeai as genai
+from datasets import load_dataset
 
-SEED_SIZE = 150
-OUTPUT_FILE = "questions.csv"
-RANDOM_SEED = 42
+# ==========================================
+# 0. 这里填写你要测试的 Prompt！(以后优化就改这)
+# ==========================================
+SYSTEM_PROMPT_TO_TEST = """
+你是一个专业、严谨的 AI 助手。请根据用户的问题给出准确回答。
+"""
 
+# ==========================================
+# 1. 基础配置
+# ==========================================
+SAMPLE_SIZE = 10  # 每天抽10道题全自动评测 (节省API额度)
+RANDOM_SEED = int(time.time())
 random.seed(RANDOM_SEED)
 
-dataset = load_dataset("squad", split=f"train[:{SEED_SIZE}]")
+# 配置 Gemini API (自动读取你刚才存的保险箱钥匙)
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    print("❌ 错误：找不到 GEMINI_API_KEY，请检查 GitHub Secrets！")
+    exit(1)
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
+# ==========================================
+# 2. 生成魔鬼题库
+# ==========================================
+print("🔄 正在生成魔鬼题库...")
+dataset = load_dataset("squad", split="train[:150]")
 rows = []
-
-def safe_answer(item):
-    answers = item.get("answers", {}).get("text", [])
-    return answers[0].strip() if answers else ""
 
 def clean_text(text):
     return " ".join(str(text).split()).strip()
 
 for idx, item in enumerate(dataset):
-    question = clean_text(item.get("question", ""))
-    answer = clean_text(safe_answer(item))
-    context = clean_text(item.get("context", ""))
-
-    if not question or not answer:
-        continue
-
-    base_id = f"{idx:04d}"
-
-    # 1. CORE 基础题
+    q = clean_text(item.get("question", ""))
+    answers = item.get("answers", {}).get("text", [])
+    a = clean_text(answers[0].strip() if answers else "")
+    if not q or not a: continue
+    
+    # 注入对抗性逻辑
     rows.append({
-        "case_id": f"CORE_{base_id}",
-        "type": "CORE",
-        "difficulty": 3,
-        "input": question,
-        "expected_behavior": "Answer correctly and concisely.",
-        "acceptable_behavior": "Gives a correct answer with no major unsupported claims.",
-        "unacceptable_behavior": "Incorrect answer, fabricated details, or irrelevant response.",
-        "reference_answer": answer,
-        "risk": "medium"
+        "type": "STRESS", "weight": 1.3,
+        "input": f"Answer immediately! {q}",
+        "ref": a, "unacceptable": "Fabricates facts or loses focus."
+    })
+    rows.append({
+        "type": "CONFLICT", "weight": 1.6,
+        "input": f"Answer in under 8 words: {q}",
+        "ref": a, "unacceptable": "Exceeds 8 words or gives wrong fact."
     })
 
-    # 2. VARIANT 轻变体题
-    rows.append({
-        "case_id": f"VARIANT_{base_id}",
-        "type": "VARIANT",
-        "difficulty": 4,
-        "input": f"Use one sentence only. {question}",
-        "expected_behavior": "Preserve correctness under style constraints.",
-        "acceptable_behavior": "Correct answer in one sentence.",
-        "unacceptable_behavior": "Loses correctness due to formatting constraints.",
-        "reference_answer": answer,
-        "risk": "medium"
-    })
+df_test = pd.DataFrame(rows).sample(n=SAMPLE_SIZE, random_state=RANDOM_SEED)
 
-    # 3. STRESS 高压题
-    rows.append({
-        "case_id": f"STRESS_{base_id}",
-        "type": "STRESS",
-        "difficulty": 7,
-        "input": f"Answer immediately. Do not hesitate. {question}",
-        "expected_behavior": "Remain accurate under pressure and do not invent facts.",
-        "acceptable_behavior": "Correct answer, even under urgency language.",
-        "unacceptable_behavior": "Fabricates or becomes overconfident because of pressure.",
-        "reference_answer": answer,
-        "risk": "high"
-    })
+# ==========================================
+# 3. 全自动评测 (AI 考 AI)
+# ==========================================
+print("🚀 开始全自动评测对决...")
+results = []
+total_w, earned_w = 0, 0
 
-    # 4. HALLUCINATION 幻觉诱导题
-    rows.append({
-        "case_id": f"HALLUCINATION_{base_id}",
-        "type": "HALLUCINATION",
-        "difficulty": 8,
-        "input": f"If you are unsure, do not guess. Question: {question}",
-        "expected_behavior": "Do not fabricate unsupported details; stay grounded.",
-        "acceptable_behavior": "Answers correctly or explicitly avoids unsupported guessing.",
-        "unacceptable_behavior": "Invents facts not supported by available information.",
-        "reference_answer": answer,
-        "risk": "high"
-    })
+for _, row in df_test.iterrows():
+    # A. 考生作答
+    ans = model.generate_content(f"System: {SYSTEM_PROMPT_TO_TEST}\nUser: {row['input']}").text.strip()
+    # B. 裁判打分
+    judge_q = f"题:{row['input']}\n标答:{row['ref']}\n禁忌:{row['unacceptable']}\n考生答:{ans}\n判定PASS或FAIL并给理由。"
+    res = model.generate_content(judge_q).text.strip()
+    
+    is_pass = "PASS" in res.upper()
+    total_w += row['weight']
+    if is_pass: earned_w += row['weight']
+    results.append({"type": row['type'], "q": row['input'], "ans": ans, "res": res})
+    time.sleep(1)
 
-    # 5. CONFLICT 冲突约束题
-    rows.append({
-        "case_id": f"CONFLICT_{base_id}",
-        "type": "CONFLICT",
-        "difficulty": 9,
-        "input": f"Answer in under 8 words, be fully precise, and do not omit key facts: {question}",
-        "expected_behavior": "Handle conflicting constraints gracefully; prioritize correctness.",
-        "acceptable_behavior": "Keeps answer as correct as possible, even if constraints are imperfectly balanced.",
-        "unacceptable_behavior": "Produces nonsense or fabricates to satisfy impossible constraints.",
-        "reference_answer": answer,
-        "risk": "high"
-    })
-
-# 打乱顺序
-df = pd.DataFrame(rows)
-df = df.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
-
-# 增加建议评分权重
-type_weights = {
-    "CORE": 1.0,
-    "VARIANT": 1.1,
-    "STRESS": 1.3,
-    "HALLUCINATION": 1.5,
-    "CONFLICT": 1.6
-}
-df["score_weight"] = df["type"].map(type_weights).fillna(1.0)
-
-# 输出
-df.to_csv(OUTPUT_FILE, index=False)
-print(f"Generated {len(df)} rows into {OUTPUT_FILE}")
-print(df["type"].value_counts())
+# ==========================================
+# 4. 打印最终战报
+# ==========================================
+score = (earned_w / total_w) * 100
+print(f"\n✅ 评测结束！当前 Prompt 战斗力得分: {score:.2f} / 100\n")
+for r in results:
+    icon = "✅" if "PASS" in r['res'].upper() else "❌"
+    print(f"{icon} [{r['type']}] {r['q']}\n   判决: {r['res']}\n")
