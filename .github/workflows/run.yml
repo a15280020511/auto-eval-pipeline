@@ -1,33 +1,17 @@
 name: Auto Eval Dataset Pipeline
-
 on:
-  schedule:
-    - cron: '0 3 * * *'   # 每天 UTC 03:00 自动运行
   workflow_dispatch:
-
 jobs:
   build-dataset:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run generator
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Run
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} # 读取保险柜
         run: python main.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-questions
-          path: questions.csv
