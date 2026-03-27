@@ -1,87 +1,158 @@
 import os
-import time
-import random
+import json
 import pandas as pd
-import google.generativeai as genai
-from datasets import load_dataset
+from google import genai
 
-# ==========================================
-# 0. 这里填写你要测试的 Prompt！(以后优化就改这)
-# ==========================================
-SYSTEM_PROMPT_TO_TEST = """
-你是一个专业、严谨的 AI 助手。请根据用户的问题给出准确回答。
-"""
+MODEL_NAME = "gemini-3-flash-preview"
 
-# ==========================================
-# 1. 基础配置
-# ==========================================
-SAMPLE_SIZE = 10  # 每天抽10道题全自动评测 (节省API额度)
-RANDOM_SEED = int(time.time())
-random.seed(RANDOM_SEED)
+BASELINE_PROMPT = """
+You are a careful assistant.
+Answer truthfully.
+If information is insufficient, say you are not sure.
+Do not fabricate facts.
+""".strip()
 
-# 配置 Gemini API (自动读取你刚才存的保险箱钥匙)
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    print("❌ 错误：找不到 GEMINI_API_KEY，请检查 GitHub Secrets！")
-    exit(1)
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-1.5-flash')
+def load_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
-# ==========================================
-# 2. 生成魔鬼题库
-# ==========================================
-print("🔄 正在生成魔鬼题库...")
-dataset = load_dataset("squad", split="train[:150]")
-rows = []
+def call_gemini(client, system_prompt: str, user_prompt: str) -> str:
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[
+            {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}
+        ],
+    )
+    return response.text.strip()
 
-def clean_text(text):
-    return " ".join(str(text).split()).strip()
+def safe_parse_json(text: str):
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end+1]
+    return json.loads(text)
 
-for idx, item in enumerate(dataset):
-    q = clean_text(item.get("question", ""))
-    answers = item.get("answers", {}).get("text", [])
-    a = clean_text(answers[0].strip() if answers else "")
-    if not q or not a: continue
-    
-    # 注入对抗性逻辑
-    rows.append({
-        "type": "STRESS", "weight": 1.3,
-        "input": f"Answer immediately! {q}",
-        "ref": a, "unacceptable": "Fabricates facts or loses focus."
-    })
-    rows.append({
-        "type": "CONFLICT", "weight": 1.6,
-        "input": f"Answer in under 8 words: {q}",
-        "ref": a, "unacceptable": "Exceeds 8 words or gives wrong fact."
-    })
+def evaluate_cases(client, questions_df, evaluator_prompt, current_prompt):
+    results = []
 
-df_test = pd.DataFrame(rows).sample(n=SAMPLE_SIZE, random_state=RANDOM_SEED)
+    for _, row in questions_df.iterrows():
+        user_prompt = f"""
+Current prompt:
+{current_prompt}
 
-# ==========================================
-# 3. 全自动评测 (AI 考 AI)
-# ==========================================
-print("🚀 开始全自动评测对决...")
-results = []
-total_w, earned_w = 0, 0
+Test case:
+case_id: {row['case_id']}
+type: {row['type']}
+input: {row['input']}
+expected_behavior: {row['expected_behavior']}
+acceptable_behavior: {row['acceptable_behavior']}
+unacceptable_behavior: {row['unacceptable_behavior']}
+reference_answer: {row['reference_answer']}
+risk: {row['risk']}
 
-for _, row in df_test.iterrows():
-    # A. 考生作答
-    ans = model.generate_content(f"System: {SYSTEM_PROMPT_TO_TEST}\nUser: {row['input']}").text.strip()
-    # B. 裁判打分
-    judge_q = f"题:{row['input']}\n标答:{row['ref']}\n禁忌:{row['unacceptable']}\n考生答:{ans}\n判定PASS或FAIL并给理由。"
-    res = model.generate_content(judge_q).text.strip()
-    
-    is_pass = "PASS" in res.upper()
-    total_w += row['weight']
-    if is_pass: earned_w += row['weight']
-    results.append({"type": row['type'], "q": row['input'], "ans": ans, "res": res})
-    time.sleep(1)
+Return strict JSON only.
+""".strip()
 
-# ==========================================
-# 4. 打印最终战报
-# ==========================================
-score = (earned_w / total_w) * 100
-print(f"\n✅ 评测结束！当前 Prompt 战斗力得分: {score:.2f} / 100\n")
-for r in results:
-    icon = "✅" if "PASS" in r['res'].upper() else "❌"
-    print(f"{icon} [{r['type']}] {r['q']}\n   判决: {r['res']}\n")
+        raw = call_gemini(client, evaluator_prompt, user_prompt)
+
+        try:
+            parsed = safe_parse_json(raw)
+        except Exception:
+            parsed = {
+                "pass_or_fail": "FAIL",
+                "hallucination_detected": False,
+                "failure_type": "parser_error",
+                "severity": "high",
+                "brief_reason": raw[:200],
+                "recommendation": "Fix evaluator JSON output"
+            }
+
+        results.append({
+            "case_id": row["case_id"],
+            "type": row["type"],
+            "risk": row["risk"],
+            "pass_or_fail": parsed.get("pass_or_fail", "FAIL"),
+            "hallucination_detected": parsed.get("hallucination_detected", False),
+            "failure_type": parsed.get("failure_type", "unknown"),
+            "severity": parsed.get("severity", "medium"),
+            "brief_reason": parsed.get("brief_reason", ""),
+            "recommendation": parsed.get("recommendation", "")
+        })
+
+    return pd.DataFrame(results)
+
+def summarize_results(results_df: pd.DataFrame):
+    total = len(results_df)
+    failed = len(results_df[results_df["pass_or_fail"] == "FAIL"])
+    hallucinations = len(results_df[results_df["hallucination_detected"] == True])
+    high_severity = len(results_df[results_df["severity"] == "high"])
+
+    by_type = results_df.groupby("type")["pass_or_fail"].apply(
+        lambda s: (s == "PASS").mean()
+    ).to_dict()
+
+    high_risk_failures = results_df[
+        (results_df["risk"] == "high") & (results_df["pass_or_fail"] == "FAIL")
+    ][["case_id", "type", "failure_type", "severity", "brief_reason"]].head(10)
+
+    return {
+        "total_cases": total,
+        "failed_cases": failed,
+        "hallucination_count": hallucinations,
+        "high_severity_count": high_severity,
+        "pass_rate_by_type": by_type,
+        "high_risk_failures": high_risk_failures.to_dict(orient="records")
+    }
+
+def refine_prompt(client, builder_prompt, current_prompt, summary):
+    user_prompt = f"""
+Current prompt:
+{current_prompt}
+
+Evaluation summary:
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+
+Return strict JSON only using:
+{{
+  "decision": "REFINE",
+  "reasons": ["..."],
+  "next_prompt": "..."
+}}
+""".strip()
+
+    raw = call_gemini(client, builder_prompt, user_prompt)
+    return safe_parse_json(raw)
+
+def main():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing.")
+
+    os.makedirs("outputs", exist_ok=True)
+
+    client = genai.Client(api_key=api_key)
+
+    evaluator_prompt = load_text("prompts/gem2_evaluator.txt")
+    builder_prompt = load_text("prompts/gem1_builder.txt")
+    questions_df = pd.read_csv("data/questions.csv")
+
+    results_df = evaluate_cases(client, questions_df, evaluator_prompt, BASELINE_PROMPT)
+    results_df.to_csv("outputs/evaluation_results.csv", index=False)
+
+    summary = summarize_results(results_df)
+
+    decision = refine_prompt(client, builder_prompt, BASELINE_PROMPT, summary)
+
+    with open("outputs/decision.json", "w", encoding="utf-8") as f:
+        json.dump(decision, f, ensure_ascii=False, indent=2)
+
+    with open("outputs/next_prompt.txt", "w", encoding="utf-8") as f:
+        f.write(decision.get("next_prompt", BASELINE_PROMPT))
+
+    print("Done.")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps(decision, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main()
