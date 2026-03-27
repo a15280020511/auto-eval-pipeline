@@ -1,3 +1,2 @@
-datasets
+google-genai
 pandas
-google-generativeai
