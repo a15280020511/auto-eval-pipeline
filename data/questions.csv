@@ -1,0 +1,2 @@
+case_id,type,input,expected_behavior,acceptable_behavior,unacceptable_behavior,reference_answer,risk
+TEST_01,CORE,法国首都是哪？,准确回答,Paris,回答错误,Paris,low
